@@ -27,6 +27,8 @@
 #include <string.h>
 #include "microbitobj.h"
 #include "nrf_gpio.h"
+#include <../delay/nrf_delay.h>
+#include "analogin_api.h"
 
 extern "C" {
 #include "py/runtime.h"
@@ -38,7 +40,8 @@ extern "C" {
 #include "lib/ticker.h"
 
 #define min(a,b) (((a)<(b))?(a):(b))
-
+#define DISPLAY_TICKER_SLOT 1
+  
 void microbit_display_show(microbit_display_obj_t *display, microbit_image_obj_t *image) {
     mp_int_t w = min(image->width(), 5);
     mp_int_t h = min(image->height(), 5);
@@ -192,6 +195,58 @@ inline void microbit_display_obj_t::setPinsForRow(uint8_t brightness) {
     }
 }
 
+/**
+  * Workaround defect 3 in PAN 2.3
+  *
+  * https://www.nordicsemi.com/eng/nordic/download_resource/24634/5/88440387
+  */
+static void analog_disable(void) {
+    NRF_ADC->ENABLE = ADC_ENABLE_ENABLE_Disabled;
+    NRF_ADC->CONFIG = (ADC_CONFIG_RES_8bit << ADC_CONFIG_RES_Pos) |
+                      (ADC_CONFIG_INPSEL_SupplyTwoThirdsPrescaling << ADC_CONFIG_INPSEL_Pos) |
+                      (ADC_CONFIG_REFSEL_VBG                       << ADC_CONFIG_REFSEL_Pos) |
+                      (ADC_CONFIG_PSEL_Disabled                    << ADC_CONFIG_PSEL_Pos) |
+                      (ADC_CONFIG_EXTREFSEL_None                   << ADC_CONFIG_EXTREFSEL_Pos);
+}
+
+static bool col_read_started = false;
+static uint8_t col_to_read;
+static int16_t light_levels[3];
+
+static int32_t meter_callback(void) {
+    if (col_read_started) {
+        light_levels[col_to_read] = NRF_ADC->RESULT;
+        analog_disable();
+        clear_ticker_callback(DISPLAY_TICKER_SLOT);
+        col_to_read += 1;
+        return -1;
+    } else {
+        /* Start ADC read, but don't block on it */
+        NRF_ADC->TASKS_START = 1;
+        col_read_started = true;
+        /* Allow 80µs. Data sheet says it takes 68µs */
+        return 5;
+    }
+}
+
+void microbit_display_obj_t::initLightMeter() {
+    if (col_to_read == 3) {
+        col_to_read = 0;
+    }
+    for(int row = MIN_ROW_PIN; row <= MAX_ROW_PIN; row++) {
+        nrf_gpio_pin_clear(row);
+    }
+    nrf_gpio_cfg_output(MIN_COLUMN_PIN+col_to_read);
+    nrf_gpio_pin_set(MIN_COLUMN_PIN+col_to_read);
+    nrf_delay_us(1);
+    nrf_gpio_cfg_input(MIN_COLUMN_PIN+col_to_read, NRF_GPIO_PIN_NOPULL);
+    analogin_t adc;
+    analogin_init(&adc, (PinName)(MIN_COLUMN_PIN+col_to_read));
+    col_read_started = false;
+    set_ticker_callback(DISPLAY_TICKER_SLOT, meter_callback, 100);
+}
+
+  
 /* This is the primary PWM driver/display driver.  It will operate on one row
  * (9 pins) per invocation.  It will turn on LEDs with maximum brightness,
  * then let the "callback" callback turn off the LEDs as appropriate for the
@@ -263,8 +318,6 @@ static const uint16_t render_timings[] =
     97,  //   8,   199,   3184µs,   195%
 // Always on  9,   375,   6000µs,   188%
 };
-
-#define DISPLAY_TICKER_SLOT 1
 
 /* This is the PWM callback.  It is registered by the animation callback and
  * will unregister itself when all of the brightness steps are complete. */
@@ -362,13 +415,22 @@ void microbit_display_tick(void) {
         return;
     }
 
-    microbit_display_obj.advanceRow();
+    static int t = 0;
+    if (t == 0) {
+        microbit_display_obj.initLightMeter();
+        microbit_display_obj.previous_brightness = 0;
+        t = 3;
+    } else {
+        microbit_display_obj.advanceRow();
 
-    microbit_display_update();
-    microbit_display_obj.previous_brightness = 0;
-    if (microbit_display_obj.brightnesses & GREYSCALE_MASK) {
-        set_ticker_callback(DISPLAY_TICKER_SLOT, callback, 1800);
+        microbit_display_update();
+        microbit_display_obj.previous_brightness = 0;
+        if (microbit_display_obj.brightnesses & GREYSCALE_MASK) {
+            set_ticker_callback(DISPLAY_TICKER_SLOT, callback, 1800);
+        }
+        t--;
     }
+    
 }
 
 
@@ -429,7 +491,7 @@ mp_obj_t microbit_display_on_func(mp_obj_t obj) {
     return mp_const_none;
 }
 MP_DEFINE_CONST_FUN_OBJ_1(microbit_display_on_obj, microbit_display_on_func);
-
+  
 mp_obj_t microbit_display_off_func(mp_obj_t obj) {
     microbit_display_obj_t *self = (microbit_display_obj_t*)obj;
     /* Disable the display loop.  This will pause any animations in progress.
@@ -468,6 +530,20 @@ mp_obj_t microbit_display_clear_func(void) {
     return mp_const_none;
 }
 MP_DEFINE_CONST_FUN_OBJ_1(microbit_display_clear_obj, microbit_display_clear_func);
+
+  //mp_obj_t microbit_display_light_meter_func(mp_obj_t self_in) {
+  //microbit_display_obj_t *self = (microbit_display_obj_t*)self_in;
+mp_obj_t microbit_display_light_meter_func(void) {
+    int32_t result = light_levels[0] + light_levels[1] + light_levels[2];
+    result = 1061 - result;
+    if (result < 0)
+        result = 0;
+    if (result > 1023)
+        result = 1023;
+    return MP_OBJ_NEW_SMALL_INT(result);
+}
+
+MP_DEFINE_CONST_FUN_OBJ_1(microbit_display_light_meter_obj, microbit_display_light_meter_func);
 
 void microbit_display_set_pixel(microbit_display_obj_t *display, mp_int_t x, mp_int_t y, mp_int_t bright) {
     if (x < 0 || y < 0 || x > 4 || y > 4) {
@@ -508,6 +584,7 @@ STATIC const mp_map_elem_t microbit_display_locals_dict_table[] = {
     { MP_OBJ_NEW_QSTR(MP_QSTR_show), (mp_obj_t)&microbit_display_show_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_scroll), (mp_obj_t)&microbit_display_scroll_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_clear), (mp_obj_t)&microbit_display_clear_obj },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_light_meter), (mp_obj_t)&microbit_display_light_meter_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_on),  (mp_obj_t)&microbit_display_on_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_off),  (mp_obj_t)&microbit_display_off_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_is_on),  (mp_obj_t)&microbit_display_is_on_obj },
